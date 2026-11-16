@@ -12,7 +12,7 @@ Pad X 8.0 (V521)** port to **LineageOS 15.1** (Android 8.1).
 
 | Commit | Subject |
 | --- | --- |
-| `f229a1f` | libril: fix the CAF SIM_IO payload, command mapping, signal strength and data registration |
+| `904ec8a` | libril: fix the CAF SIM_IO payload, command mapping, signal strength and data registration |
 
 The radio daemon of this device is the CAF `libril.so` blob, and the HIDL
 RIL on the platform side has to speak its dialect:
