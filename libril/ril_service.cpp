@@ -33,6 +33,9 @@
 #include <inttypes.h>
 #include <map>
 #include <mutex>
+#include <string>
+
+#include "plmn_name_table.h"
 
 #define INVALID_HEX_CHAR 16
 
@@ -4955,7 +4958,9 @@ int radio::setNetworkSelectionModeManualResponse(int slotId,
 }
 
 int convertOperatorStatusToInt(const char *str) {
-    if (strncmp("unknown", str, 9) == 0) {
+    if (str == NULL) {
+        return -1;
+    } else if (strncmp("unknown", str, 9) == 0) {
         return (int) OperatorStatus::UNKNOWN;
     } else if (strncmp("available", str, 9) == 0) {
         return (int) OperatorStatus::AVAILABLE;
@@ -4966,6 +4971,138 @@ int convertOperatorStatusToInt(const char *str) {
     } else {
         return -1;
     }
+}
+
+// True when the modem's PLMN name table has no entry for a network and it
+// fell back to one of its generic placeholders.
+static bool isCafPlmnPlaceholder(const char *name) {
+    return name != NULL
+            && (strcmp(name, "Home") == 0 || strcmp(name, "Roam") == 0
+                    || strcmp(name, "Roaming") == 0);
+}
+
+// Look up the carrier name of a PLMN.  The key is the operator numeric the
+// RIL reports, which is the MCC concatenated with the MNC (MNC as "%02d",
+// so "310410" is MCC 310 / MNC 410 and "31070" is MCC 310 / MNC 70).
+//
+// The table is Qualcomm's SE.13 static operator name table, extracted from
+// the vendor RIL blob, extended with the modern US carriers SE.13 does not
+// know about.  See plmn_name_table.h.
+static const char *lookupPlmnName(const char *numeric) {
+    if (numeric == NULL || numeric[0] == '\0') {
+        return NULL;
+    }
+    size_t lo = 0;
+    size_t hi = kPlmnNameTableSize;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(numeric, kPlmnNameTable[mid].mccmnc);
+        if (cmp == 0) {
+            return kPlmnNameTable[mid].name;
+        } else if (cmp < 0) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return NULL;
+}
+
+// The radio access technology of a scanned network, as reported by the
+// vendor blob in the fifth field of every scan record.  The blob uses its
+// own numbering in which LTE is 14; LG's own stock telephony parses the
+// very same values (see PlmnListParser.getNetworkTechnologyType in the
+// stock framework, where 14 and 18 select the "ratlte" name field).
+static const char *radioTechnologyLabel(const char *rat) {
+    if (rat == NULL || rat[0] == '\0') {
+        return NULL;
+    }
+    switch (atoi(rat)) {
+        case 1:  return "GPRS";
+        case 2:  return "EDGE";
+        case 3:  return "UMTS";
+        case 4:  return "IS-95A";
+        case 5:  return "IS-95B";
+        case 6:  return "1xRTT";
+        case 7:  return "EVDO";
+        case 8:  return "EVDO-A";
+        case 9:  return "HSDPA";
+        case 10: return "HSUPA";
+        case 11: return "HSPA";
+        case 12: return "IDEN";
+        case 13: return "EVDO-B";
+        case 14: return "LTE";
+        case 15: return "HSPAP";
+        case 16: return "GSM";
+        case 17: return "TD-SCDMA";
+        case 18: return "LTE-CA";
+        default: return NULL;
+    }
+}
+
+// Render one entry of the network selection list.
+//
+// The dialog shows operatorAlphaLong and nothing else, and the HIDL
+// OperatorInfo has no field for the radio access technology, so the name,
+// the MCC+MNC and the RAT all have to end up in a single string:
+//
+//     AT&T (310410) LTE
+//     311589 LTE
+static std::string buildNetworkLabel(const char *numeric, const char *name,
+        const char *rat) {
+    std::string label;
+    if (name != NULL && name[0] != '\0') {
+        label += name;
+        if (numeric != NULL && numeric[0] != '\0') {
+            label += " (";
+            label += numeric;
+            label += ")";
+        }
+    } else if (numeric != NULL && numeric[0] != '\0') {
+        label += numeric;
+    }
+    const char *ratLabel = radioTechnologyLabel(rat);
+    if (ratLabel != NULL) {
+        if (!label.empty()) {
+            label += " ";
+        }
+        label += ratLabel;
+    }
+    return label;
+}
+
+// The vendor RIL blob (libril-qc-qmi-1.so) answers
+// RIL_REQUEST_QUERY_AVAILABLE_NETWORKS with one record per network, each
+// record being an array of char*.  CAF's RIL_OperatorInfo has FIVE
+// pointers per record
+//
+//     [0] alphaLong   [1] alphaShort   [2] operatorNumeric
+//     [3] state       [4] RAT
+//
+// while AOSP's flat layout has only four (no RAT).  Both put the state
+// string at index 3, so only the stride differs.
+//
+// LG's own stock RIL.java (responseOperatorInfos) expects a multiple of
+// five strings and reads [2] as the numeric and [4] as the RAT, so the
+// blob really does send five.  Treating that payload as four pointer
+// records makes the length check below fail, and the framework then
+// reports RadioError::INVALID_RESPONSE ("Error while searching for
+// networks." in the network selection dialog).
+static const size_t kOperatorInfoCafStride = 5;
+static const size_t kOperatorInfoAospStride = 4;
+
+// True when every record looks like an operator info record: a non empty
+// numeric field at index 2 and a known state string at index 3.
+static bool isOperatorInfoResponse(char **resp, size_t numStrings, size_t stride) {
+    for (size_t i = 0; i + stride <= numStrings; i += stride) {
+        if (resp[i + 2] == NULL || resp[i + 2][0] == '\0') {
+            return false;
+        }
+        if (convertOperatorStatusToInt(resp[i + 3]) == -1) {
+            return false;
+        }
+    }
+    return true;
 }
 
 int radio::getAvailableNetworksResponse(int slotId,
@@ -4979,17 +5116,55 @@ int radio::getAvailableNetworksResponse(int slotId,
         RadioResponseInfo responseInfo = {};
         populateResponseInfo(responseInfo, serial, responseType, e);
         hidl_vec<OperatorInfo> networks;
-        if ((response == NULL && responseLen != 0)
-                || responseLen % (4 * sizeof(char *))!= 0) {
+
+        // Pick the record stride.  CAF's five pointer records are tried
+        // first, AOSP's four pointer records second; the payload is
+        // validated instead of guessed, so a blob that switches layout
+        // keeps working.
+        size_t stride = 0;
+        if (response != NULL && responseLen != 0
+                && responseLen % sizeof(char *) == 0) {
+            char **resp = (char **) response;
+            size_t numStrings = responseLen / sizeof(char *);
+            if (numStrings % kOperatorInfoCafStride == 0
+                    && isOperatorInfoResponse(resp, numStrings, kOperatorInfoCafStride)) {
+                stride = kOperatorInfoCafStride;
+            } else if (numStrings % kOperatorInfoAospStride == 0
+                    && isOperatorInfoResponse(resp, numStrings, kOperatorInfoAospStride)) {
+                stride = kOperatorInfoAospStride;
+            }
+        }
+
+        if (stride == 0) {
             RLOGE("getAvailableNetworksResponse Invalid response: NULL");
             if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
         } else {
             char **resp = (char **) response;
             int numStrings = responseLen / sizeof(char *);
-            networks.resize(numStrings/4);
-            for (int i = 0, j = 0; i < numStrings; i = i + 4, j++) {
-                networks[j].alphaLong = convertCharPtrToHidlString(resp[i]);
-                networks[j].alphaShort = convertCharPtrToHidlString(resp[i + 1]);
+            networks.resize(numStrings / stride);
+            for (int i = 0, j = 0; i < numStrings; i = i + stride, j++) {
+                const char *numeric = resp[i + 2];
+                // The RAT is only present in CAF's five pointer records.
+                const char *rat = (stride == kOperatorInfoCafStride) ? resp[i + 4] : NULL;
+
+                // The modem's PLMN name table only knows the carriers it
+                // was built for, so for every other network it hands out
+                // the generic placeholders "Home" and "Roam".  The network
+                // selection dialog would then list every network as
+                // "Home" or "Roam", which identifies nothing, so use the
+                // name from the local PLMN table instead.
+                const char *name = NULL;
+                if (!isCafPlmnPlaceholder(resp[i])) {
+                    name = resp[i];
+                } else if (!isCafPlmnPlaceholder(resp[i + 1])) {
+                    name = resp[i + 1];
+                }
+                if (name == NULL) {
+                    name = lookupPlmnName(numeric);
+                }
+
+                networks[j].alphaLong = buildNetworkLabel(numeric, name, rat);
+                networks[j].alphaShort = (name != NULL) ? name : "";
 #ifndef OLD_MNC_FORMAT
                 networks[j].operatorNumeric = convertCharPtrToHidlString(resp[i + 2]);
 #else
