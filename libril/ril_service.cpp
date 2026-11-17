@@ -31,6 +31,8 @@
 #include <hidl/HidlTransportSupport.h>
 #include <utils/SystemClock.h>
 #include <inttypes.h>
+#include <map>
+#include <mutex>
 
 #define INVALID_HEX_CHAR 16
 
@@ -111,6 +113,11 @@ void convertRilLceDataInfoToHal(void *response, size_t responseLen, LceDataInfo&
 
 void convertRilSignalStrengthToHal(void *response, size_t responseLen,
         SignalStrength& signalStrength);
+void convertRilSignalStrengthToHalV8(void *response, size_t responseLen,
+        SignalStrength& signalStrength);
+void convertRilSignalStrengthToHalV10(void *response, size_t responseLen,
+        SignalStrength& signalStrength);
+void convertCafRilSignalStrengthToHal(void *response, SignalStrength& signalStrength);
 
 void convertRilDataCallToHal(RIL_Data_Call_Response_v6 *dcResponse,
         SetupDataCallResult& dcResult);
@@ -132,6 +139,29 @@ struct RadioImpl : public V1_1::IRadio {
     sp<IRadioIndication> mRadioIndication;
     sp<V1_1::IRadioResponse> mRadioResponseV1_1;
     sp<V1_1::IRadioIndication> mRadioIndicationV1_1;
+
+    /*
+     * Cache of the last voice registration state that the vendor RIL
+     * reported for this slot.
+     *
+     * The vendor RIL that LG shipped for the V521 (libril-qc-qmi-1.so, CAF
+     * 3.5) does not implement RIL_REQUEST_DATA_REGISTRATION_STATE at all: it
+     * answers with RIL_E_SUCCESS but an empty payload, which this HIDL layer
+     * has to report as RadioError::INVALID_RESPONSE.
+     *
+     * Android 8.1 derives the packet-data service state and the data network
+     * type (gsm.network.type) from the *data* registration state, so without a
+     * data registration state the whole data stack stays down even though the
+     * modem is registered on LTE.  On an LTE network the voice and the data
+     * registration are the same EPS registration, so this cached voice state
+     * is used as the data registration state (see
+     * getDataRegistrationStateResponse()).
+     *
+     * Both the write and the read happen on the vendor RIL's response thread,
+     * one RIL daemon per slot, so no additional locking is needed.
+     */
+    VoiceRegStateResult mLastVoiceRegState = {};
+    bool mHaveLastVoiceRegState = false;
 
     Return<void> setResponseFunctions(
             const ::android::sp<IRadioResponse>& radioResponse,
@@ -500,6 +530,65 @@ void memsetAndFreeStrings(int numPointers, ...) {
         }
     }
     va_end(ap);
+}
+
+/*
+ * Lifetime handling for the strings of an RIL_REQUEST_SIM_IO request.
+ *
+ * The CAF vendor RIL (libril-qc-qmi-1.so) is handed a pointer to the request
+ * payload and it reads the SIM_IO strings (path, data, pin2, aidPtr) out of
+ * that buffer.  AOSP's own implementation of iccIOForApp() hands the vendor a
+ * *stack* buffer and never frees anything, which means the vendor is
+ * expected to consume the payload during onRequest().  The CAF blob however
+ * can also keep parts of it around (it forwards the path/data to the QMI UIM
+ * request), so releasing the strings right after onRequest() returns is a
+ * use-after-free.
+ *
+ * The strings are therefore kept alive until the response for that request
+ * comes back and are released in radio::iccIOForAppResponse().
+ */
+struct SimIoRequestStrings {
+    char *path;
+    char *data;
+    char *pin2;
+    char *aidPtr;
+};
+
+static std::mutex g_simIoStringsMutex;
+static std::map<int32_t, SimIoRequestStrings *> g_simIoStrings;
+
+/**
+ * Frees a set of SIM_IO strings.
+ */
+static void freeSimIoStrings(SimIoRequestStrings *strings) {
+    if (strings != NULL) {
+        memsetAndFreeStrings(4, strings->path, strings->data, strings->pin2, strings->aidPtr);
+        delete strings;
+    }
+}
+
+/**
+ * Takes ownership of the given strings until the response for 'token' arrives.
+ */
+static void registerSimIoStrings(int32_t token, SimIoRequestStrings *strings) {
+    std::lock_guard<std::mutex> lock(g_simIoStringsMutex);
+    g_simIoStrings[token] = strings;
+}
+
+/**
+ * Releases the strings that were registered for 'token', if any.
+ */
+static void releaseSimIoStrings(int32_t token) {
+    SimIoRequestStrings *strings = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_simIoStringsMutex);
+        std::map<int32_t, SimIoRequestStrings *>::iterator it = g_simIoStrings.find(token);
+        if (it != g_simIoStrings.end()) {
+            strings = it->second;
+            g_simIoStrings.erase(it);
+        }
+    }
+    freeSimIoStrings(strings);
 }
 
 void sendErrorResponse(RequestInfo *pRI, RIL_Errno err) {
@@ -1164,6 +1253,94 @@ Return<void> RadioImpl::setupDataCall(int32_t serial, RadioTechnology radioTechn
     return Void();
 }
 
+/*
+ * Payload layout the CAF vendor RIL expects for RIL_REQUEST_SIM_IO.
+ *
+ * The CAF RIL that LG shipped for the V521
+ * (vendor/lge/v521/proprietary/vendor/lib/libril-qc-qmi-1.so, CAF 3.5)
+ * does not use the AOSP RIL_SIM_IO_v6 layout.  Its
+ * qcril_uim_request_sim_io() reads the payload with every field shifted
+ * up by one 32-bit word:
+ *
+ *      +0   int     request id / reserved  (not read by the vendor)
+ *      +4   int     command
+ *      +8   int     fileid
+ *      +12  char *  path
+ *      +16  int     p1
+ *      +20  int     p2
+ *      +24  int     p3
+ *      +28  char *  data
+ *      +32  char *  pin2
+ *      +36  char *  aidPtr
+ *
+ * This was confirmed by reverse engineering the vendor blob:
+ *   - qcril_uim_request_sim_io() switches on the command at +4 and
+ *     accepts 176/178/192/203/214/219/220/242,
+ *   - its log statement
+ *     "qcril_uim_request_sim_io(%d, 0x%X, %s, %d, %d, %d, %s, %s)"
+ *     takes command@+4, fileid@+8, path@+12, p1@+16, p2@+20, p3@+24,
+ *     data@+28 and pin2@+32,
+ *   - the per-command helpers validate p1@+16, p2@+20 and p3@+24.
+ *
+ * Passing an AOSP RIL_SIM_IO_v6 instead makes the vendor read the
+ * fileid as the command (so every read fails with
+ * RIL_E_REQUEST_NOT_SUPPORTED) and read the aid pointer four bytes
+ * past the end of the buffer, which segfaults rild.
+ */
+typedef struct {
+    int   request;
+    int   command;
+    int   fileid;
+    char *path;
+    int   p1;
+    int   p2;
+    int   p3;
+    char *data;
+    char *pin2;
+    char *aidPtr;
+} CAF_RIL_SIM_IO;
+
+/*
+ * The "command" of an RIL_REQUEST_SIM_IO request.
+ *
+ * The framework (frameworks/opt/telephony/src/java/com/android/internal/
+ * telephony/uicc/IccFileHandler.java) uses the ISO 7816-4 APDU
+ * instruction bytes:
+ *
+ *      0xB0 (176)  READ BINARY
+ *      0xB2 (178)  READ RECORD
+ *      0xC0 (192)  GET RESPONSE
+ *      0xD6 (214)  UPDATE BINARY
+ *      0xDC (220)  UPDATE RECORD
+ *
+ * The CAF RIL that LG shipped for the V521
+ * (vendor/lge/v521/proprietary/vendor/lib/libril-qc-qmi-1.so, CAF 3.5)
+ * uses exactly the same numbering.  This was confirmed by
+ * disassembling the switch in qcril_uim_request_sim_io():
+ *
+ *      176 -> qcril_uim_read_binary()
+ *      178 -> qcril_uim_read_record()
+ *      192 -> qcril_uim_get_response()
+ *      203 -> NOTIMPL (RETRIEVE DATA)
+ *      214 -> qcril_uim_update_binary()
+ *      219 -> NOTIMPL (SET DATA)
+ *      220 -> qcril_uim_update_record()
+ *      242 -> (misc)
+ *
+ * So the command has to be passed through unchanged.
+ *
+ * Getting this wrong is fatal for the data stack: IccFileHandler first
+ * asks for the size of an elementary file with a GET RESPONSE, and only
+ * issues the READ BINARY once that succeeded.  If the GET RESPONSE is
+ * rejected the framework never reads anything, so it never learns the
+ * ICCID, no subscription is created, no APN is configured and mobile
+ * data never comes up.
+ */
+static int convertSimIoCommandToVendor(int command)
+{
+    return command;
+}
+
 Return<void> RadioImpl::iccIOForApp(int32_t serial, const IccIo& iccIo) {
 #if VDBG
     RLOGD("iccIOForApp: serial %d", serial);
@@ -1173,35 +1350,58 @@ Return<void> RadioImpl::iccIOForApp(int32_t serial, const IccIo& iccIo) {
         return Void();
     }
 
-    RIL_SIM_IO_v6 rilIccIo = {};
-    rilIccIo.command = iccIo.command;
+    CAF_RIL_SIM_IO rilIccIo = {};
+    rilIccIo.request = RIL_REQUEST_SIM_IO;
+    rilIccIo.command = convertSimIoCommandToVendor(iccIo.command);
     rilIccIo.fileid = iccIo.fileId;
-    if (!copyHidlStringToRil(&rilIccIo.path, iccIo.path, pRI)) {
+
+    /*
+     * The strings are owned by the registry until the response arrives, see
+     * the comment above registerSimIoStrings().
+     */
+    SimIoRequestStrings *strings = new SimIoRequestStrings();
+    strings->path = NULL;
+    strings->data = NULL;
+    strings->pin2 = NULL;
+    strings->aidPtr = NULL;
+
+    if (!copyHidlStringToRil(&strings->path, iccIo.path, pRI)) {
+        freeSimIoStrings(strings);
         return Void();
     }
+
+    rilIccIo.path = strings->path;
 
     rilIccIo.p1 = iccIo.p1;
     rilIccIo.p2 = iccIo.p2;
     rilIccIo.p3 = iccIo.p3;
 
-    if (!copyHidlStringToRil(&rilIccIo.data, iccIo.data, pRI)) {
-        memsetAndFreeStrings(1, rilIccIo.path);
+    if (!copyHidlStringToRil(&strings->data, iccIo.data, pRI)) {
+        freeSimIoStrings(strings);
         return Void();
     }
+    rilIccIo.data = strings->data;
 
-    if (!copyHidlStringToRil(&rilIccIo.pin2, iccIo.pin2, pRI)) {
-        memsetAndFreeStrings(2, rilIccIo.path, rilIccIo.data);
+    if (!copyHidlStringToRil(&strings->pin2, iccIo.pin2, pRI)) {
+        freeSimIoStrings(strings);
         return Void();
     }
+    rilIccIo.pin2 = strings->pin2;
 
-    if (!copyHidlStringToRil(&rilIccIo.aidPtr, iccIo.aid, pRI)) {
-        memsetAndFreeStrings(3, rilIccIo.path, rilIccIo.data, rilIccIo.pin2);
+    if (!copyHidlStringToRil(&strings->aidPtr, iccIo.aid, pRI)) {
+        freeSimIoStrings(strings);
         return Void();
     }
+    rilIccIo.aidPtr = strings->aidPtr;
+
+    /*
+     * Register before handing the request over: the vendor may answer
+     * synchronously, in which case the response handler releases the strings
+     * right away.
+     */
+    registerSimIoStrings(serial, strings);
 
     CALL_ONREQUEST(RIL_REQUEST_SIM_IO, &rilIccIo, sizeof(rilIccIo), pRI, mSlotId);
-
-    memsetAndFreeStrings(4, rilIccIo.path, rilIccIo.data, rilIccIo.pin2, rilIccIo.aidPtr);
 
     return Void();
 }
@@ -3016,6 +3216,50 @@ int responseInt(RadioResponseInfo& responseInfo, int serial, int responseType, R
     return ret;
 }
 
+/*
+ * ICC card status payload layout used by the CAF vendor RIL that LG shipped
+ * for the V521 (vendor/lge/v521/proprietary/vendor/lib/libril-qc-qmi-1.so,
+ * CAF 3.5).
+ *
+ * The vendor returns a wider RIL_AppStatus than this header declares: 48
+ * bytes per application instead of 32, so the whole RIL_CardStatus_v6 is 408
+ * bytes instead of 280.
+ *
+ * Without the extra words the HIDL radio service sees the wrong response
+ * length for RIL_REQUEST_GET_ICC_STATUS / RIL_REQUEST_GET_SIM_STATUS and
+ * reports the card as absent.  That keeps the framework from ever creating a
+ * subscription, and without a subscription no APN is configured and the data
+ * stack never comes up.
+ *
+ * The extra words are only meaningful to the vendor (retry counters and
+ * friends) and are ignored here.
+ *
+ * Verified against the device: the vendor returns 408 bytes, the
+ * application array starts at offset 24 and the applications are 48 bytes
+ * apart (aid_ptr at +12, app_label_ptr at +16 of each application).
+ */
+typedef struct {
+    int          app_type;
+    int          app_state;
+    int          perso_substate;
+    char        *aid_ptr;
+    char        *app_label_ptr;
+    int          pin1_replaced;
+    RIL_PinState pin1;
+    RIL_PinState pin2;
+    int          caf_reserved[4];
+} CAF_RIL_APP_STATUS;
+
+typedef struct {
+    RIL_CardState card_state;
+    RIL_PinState  universal_pin_state;
+    int           gsm_umts_subscription_app_index;
+    int           cdma_subscription_app_index;
+    int           ims_subscription_app_index;
+    int           num_applications;
+    CAF_RIL_APP_STATUS applications[RIL_CARD_MAX_APPS];
+} CAF_RIL_CARD_STATUS_V6;
+
 int radio::getIccCardStatusResponse(int slotId,
                                    int responseType, int serial, RIL_Errno e,
                                    void *response, size_t responseLen) {
@@ -3023,12 +3267,13 @@ int radio::getIccCardStatusResponse(int slotId,
         RadioResponseInfo responseInfo = {};
         populateResponseInfo(responseInfo, serial, responseType, e);
         CardStatus cardStatus = {};
-        RIL_CardStatus_v6 *p_cur = ((RIL_CardStatus_v6 *) response);
-        if (response == NULL || responseLen != sizeof(RIL_CardStatus_v6)
+        CAF_RIL_CARD_STATUS_V6 *p_cur = ((CAF_RIL_CARD_STATUS_V6 *) response);
+        if (response == NULL || responseLen != sizeof(CAF_RIL_CARD_STATUS_V6)
                 || p_cur->gsm_umts_subscription_app_index >= p_cur->num_applications
                 || p_cur->cdma_subscription_app_index >= p_cur->num_applications
                 || p_cur->ims_subscription_app_index >= p_cur->num_applications) {
-            RLOGE("getIccCardStatusResponse: Invalid response");
+            RLOGE("getIccCardStatusResponse: Invalid response len=%d expected=%d",
+                    (int)responseLen, (int)sizeof(CAF_RIL_CARD_STATUS_V6));
             if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
         } else {
             cardStatus.cardState = (CardState) p_cur->card_state;
@@ -3037,7 +3282,7 @@ int radio::getIccCardStatusResponse(int slotId,
             cardStatus.cdmaSubscriptionAppIndex = p_cur->cdma_subscription_app_index;
             cardStatus.imsSubscriptionAppIndex = p_cur->ims_subscription_app_index;
 
-            RIL_AppStatus *rilAppStatus = p_cur->applications;
+            CAF_RIL_APP_STATUS *rilAppStatus = p_cur->applications;
             cardStatus.applications.resize(p_cur->num_applications);
             AppStatus *appStatus = cardStatus.applications.data();
 #if VDBG
@@ -3478,6 +3723,106 @@ int radio::getLastCallFailCauseResponse(int slotId,
     return 0;
 }
 
+/*
+ * Signal strength payload layout used by the CAF vendor RIL that LG shipped
+ * for the V521 (vendor/lge/v521/proprietary/vendor/lib/libril-qc-qmi-1.so,
+ * CAF 3.5).
+ *
+ * The vendor answers RIL_REQUEST_SIGNAL_STRENGTH (and the matching unsol)
+ * with 64 bytes, while the AOSP RIL_SignalStrength_v8/v10 structures of this
+ * header are 52 and 56 bytes long.  Because of that the HIDL layer used to
+ * reject every answer with RadioError::INVALID_RESPONSE and the framework
+ * never learned the signal strength.
+ *
+ * The 64 byte layout was recovered by dumping the raw payload and matching
+ * it against the vendor's own report
+ * (qcril_qmi_nas_dump_sign_strength_report), which prints the same values:
+ *
+ *      GW       signalStrength 99, bitErrorRate 0
+ *      GW extra dbm -1, ecio -1
+ *      CDMA     dbm -1, ecio -1
+ *      EVDO     dbm -1, ecio -1, signalNoiseRatio -1
+ *      LTE      signalStrength 18, rsrp 111, rsrq 16, rsnnr 14
+ *      TDSCDMA  signalStrength 2147483647
+ *
+ * gives
+ *
+ *      +0   int   GW    signalStrength
+ *      +4   int   GW    bitErrorRate
+ *      +8   int   GW extra dbm
+ *      +12  int   GW extra ecio
+ *      +16  int   CDMA  dbm
+ *      +20  int   CDMA  ecio
+ *      +24  int   EVDO  dbm
+ *      +28  int   EVDO  ecio
+ *      +32  int   EVDO  signalNoiseRatio
+ *      +36  int   LTE   signalStrength
+ *      +40  int   LTE   rsrp
+ *      +44  int   LTE   rsrq
+ *      +48  int   LTE   rsnr
+ *      +52  int   TDSCDMA signalStrength
+ *      +56  int   WCDMA signalStrength
+ *      +60  int   WCDMA bitErrorRate
+ *
+ * Note that CAF's LTE structure has no cqi and no timing advance, and that
+ * CAF's TDSCDMA structure holds a signal strength instead of an rscp.
+ */
+typedef struct {
+    int gw_signalStrength;
+    int gw_bitErrorRate;
+    int gwExtra_dbm;
+    int gwExtra_ecio;
+    int cdma_dbm;
+    int cdma_ecio;
+    int evdo_dbm;
+    int evdo_ecio;
+    int evdo_signalNoiseRatio;
+    int lte_signalStrength;
+    int lte_rsrp;
+    int lte_rsrq;
+    int lte_rssnr;
+    int tdScdma_signalStrength;
+    int wcdma_signalStrength;
+    int wcdma_bitErrorRate;
+} CAF_RIL_SIGNAL_STRENGTH;
+
+void convertCafRilSignalStrengthToHal(void *response, SignalStrength& signalStrength) {
+    CAF_RIL_SIGNAL_STRENGTH *ss = (CAF_RIL_SIGNAL_STRENGTH *) response;
+
+    // Fixup LTE for backwards compatibility, same rules as the AOSP
+    // conversion functions: -1 means "not available".
+    int lteSignalStrength = ss->lte_signalStrength;
+    int lteRsrp = ss->lte_rsrp;
+    int lteRsrq = ss->lte_rsrq;
+
+    if (lteSignalStrength == -1) {
+        lteSignalStrength = 99;
+    }
+    if (lteRsrp == -1) {
+        lteRsrp = INT_MAX;
+    } else if (lteRsrp < -1) {
+        lteRsrp = -lteRsrp;
+    }
+    if (lteRsrq == -1) {
+        lteRsrq = INT_MAX;
+    }
+
+    signalStrength.gw.signalStrength = ss->gw_signalStrength;
+    signalStrength.gw.bitErrorRate = ss->gw_bitErrorRate;
+    signalStrength.cdma.dbm = ss->cdma_dbm;
+    signalStrength.cdma.ecio = ss->cdma_ecio;
+    signalStrength.evdo.dbm = ss->evdo_dbm;
+    signalStrength.evdo.ecio = ss->evdo_ecio;
+    signalStrength.evdo.signalNoiseRatio = ss->evdo_signalNoiseRatio;
+    signalStrength.lte.signalStrength = lteSignalStrength;
+    signalStrength.lte.rsrp = lteRsrp;
+    signalStrength.lte.rsrq = lteRsrq;
+    signalStrength.lte.rssnr = ss->lte_rssnr;
+    signalStrength.lte.cqi = INT_MAX;
+    signalStrength.lte.timingAdvance = INT_MAX;
+    signalStrength.tdScdma.rscp = INT_MAX;
+}
+
 int radio::getSignalStrengthResponse(int slotId,
                                      int responseType, int serial, RIL_Errno e,
                                      void *response, size_t responseLen) {
@@ -3489,12 +3834,20 @@ int radio::getSignalStrengthResponse(int slotId,
         RadioResponseInfo responseInfo = {};
         populateResponseInfo(responseInfo, serial, responseType, e);
         SignalStrength signalStrength = {};
-        if (response == NULL || (responseLen != sizeof(RIL_SignalStrength_v10)
-                && responseLen != sizeof(RIL_SignalStrength_v8))) {
-            RLOGE("getSignalStrengthResponse: Invalid response");
+        if (response == NULL) {
+            RLOGE("getSignalStrengthResponse: Invalid response (NULL)");
             if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
+        } else if (responseLen == sizeof(CAF_RIL_SIGNAL_STRENGTH)) {
+            convertCafRilSignalStrengthToHal(response, signalStrength);
+        } else if (responseLen == sizeof(RIL_SignalStrength_v10)) {
+            convertRilSignalStrengthToHalV10(response, responseLen, signalStrength);
+        } else if (responseLen == sizeof(RIL_SignalStrength_v8)) {
+            convertRilSignalStrengthToHalV8(response, responseLen, signalStrength);
         } else {
-            convertRilSignalStrengthToHal(response, responseLen, signalStrength);
+            RLOGE("getSignalStrengthResponse: Invalid response len=%d v8=%d v10=%d",
+                    (int)responseLen, (int)sizeof(RIL_SignalStrength_v8),
+                    (int)sizeof(RIL_SignalStrength_v10));
+            if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
         }
 
         Return<void> retStatus = radioService[slotId]->mRadioResponse->getSignalStrengthResponse(
@@ -3809,6 +4162,7 @@ int radio::getVoiceRegistrationStateResponse(int slotId,
         populateResponseInfo(responseInfo, serial, responseType, e);
 
         VoiceRegStateResult voiceRegResponse = {};
+        bool voiceRegResponseValid = false;
         int numStrings = responseLen / sizeof(char *);
         if (response == NULL) {
                RLOGE("getVoiceRegistrationStateResponse Invalid response: NULL");
@@ -3828,6 +4182,7 @@ int radio::getVoiceRegistrationStateResponse(int slotId,
                 voiceRegResponse.reasonForDenial = ATOI_NULL_HANDLED_DEF(resp[13], 0);
                 fillCellIdentityFromVoiceRegStateResponseString(voiceRegResponse.cellIdentity,
                         numStrings, resp);
+                voiceRegResponseValid = true;
             }
         } else {
             RIL_VoiceRegistrationStateResponse *voiceRegState =
@@ -3846,7 +4201,17 @@ int radio::getVoiceRegistrationStateResponse(int slotId,
                 voiceRegResponse.reasonForDenial = voiceRegState->reasonForDenial;
                 fillCellIdentityResponse(voiceRegResponse.cellIdentity,
                         voiceRegState->cellIdentity);
+                voiceRegResponseValid = true;
             }
+        }
+
+        /*
+         * Remember the voice registration state: it is the fallback for the
+         * data registration state, which this vendor RIL does not implement.
+         */
+        if (voiceRegResponseValid) {
+            radioService[slotId]->mLastVoiceRegState = voiceRegResponse;
+            radioService[slotId]->mHaveLastVoiceRegState = true;
         }
 
         Return<void> retStatus =
@@ -3872,14 +4237,17 @@ int radio::getDataRegistrationStateResponse(int slotId,
         RadioResponseInfo responseInfo = {};
         populateResponseInfo(responseInfo, serial, responseType, e);
         DataRegStateResult dataRegResponse = {};
+        bool dataRegResponseInvalid = false;
         if (response == NULL) {
             RLOGE("getDataRegistrationStateResponse Invalid response: NULL");
             if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
+            dataRegResponseInvalid = true;
         } else if (s_vendorFunctions->version <= 14) {
             int numStrings = responseLen / sizeof(char *);
             if ((numStrings != 6) && (numStrings != 11)) {
                 RLOGE("getDataRegistrationStateResponse Invalid response: NULL");
                 if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
+                dataRegResponseInvalid = true;
             } else {
                 char **resp = (char **) response;
                 dataRegResponse.regState = (RegState) ATOI_NULL_HANDLED_DEF(resp[0], 4);
@@ -3896,6 +4264,7 @@ int radio::getDataRegistrationStateResponse(int slotId,
             if (responseLen != sizeof(RIL_DataRegistrationStateResponse)) {
                 RLOGE("getDataRegistrationStateResponse Invalid response: NULL");
                 if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
+                dataRegResponseInvalid = true;
             } else {
                 dataRegResponse.regState = (RegState) dataRegState->regState;
                 dataRegResponse.rat = dataRegState->rat;;
@@ -3903,6 +4272,39 @@ int radio::getDataRegistrationStateResponse(int slotId,
                 dataRegResponse.maxDataCalls = dataRegState->maxDataCalls;
                 fillCellIdentityResponse(dataRegResponse.cellIdentity, dataRegState->cellIdentity);
             }
+        }
+
+        /*
+         * The vendor RIL that LG shipped for the V521 (libril-qc-qmi-1.so,
+         * CAF 3.5) does not implement RIL_REQUEST_DATA_REGISTRATION_STATE: it
+         * answers with RIL_E_SUCCESS but an empty payload, which is reported
+         * here as RadioError::INVALID_RESPONSE.
+         *
+         * Android 8.1 derives the packet-data service state and the data
+         * network type (gsm.network.type) from the *data* registration state.
+         * Without it the data stack never comes up, even though the modem is
+         * registered on LTE and the voice registration is in service.
+         *
+         * On LTE the voice and the data registration are the same EPS
+         * registration, so the last voice registration state that the vendor
+         * RIL reported is used as the data registration state.  This is the
+         * mirror image of AOSP's useDataRegStateForDataOnlyDevices() in
+         * ServiceStateTracker.
+         */
+        if (dataRegResponseInvalid && e == RIL_E_SUCCESS
+                && radioService[slotId]->mHaveLastVoiceRegState) {
+            RLOGI("getDataRegistrationStateResponse: vendor RIL does not implement the data "
+                    "registration state, using the voice registration state "
+                    "(regState=%d rat=%d)",
+                    radioService[slotId]->mLastVoiceRegState.regState,
+                    radioService[slotId]->mLastVoiceRegState.rat);
+
+            dataRegResponse.regState = radioService[slotId]->mLastVoiceRegState.regState;
+            dataRegResponse.rat = radioService[slotId]->mLastVoiceRegState.rat;
+            dataRegResponse.reasonDataDenied = 0;
+            dataRegResponse.maxDataCalls = 1;
+            dataRegResponse.cellIdentity = radioService[slotId]->mLastVoiceRegState.cellIdentity;
+            responseInfo.error = RadioError::NONE;
         }
 
         Return<void> retStatus =
@@ -4103,6 +4505,7 @@ IccIoResult responseIccIo(RadioResponseInfo& responseInfo, int serial, int respo
                            RIL_Errno e, void *response, size_t responseLen) {
     populateResponseInfo(responseInfo, serial, responseType, e);
     IccIoResult result = {};
+    RLOGD("responseIccIo: e=%d responseLen=%d", (int)e, (int)responseLen);
 
     if (response == NULL || responseLen != sizeof(RIL_SIM_IO_Response)) {
         RLOGE("Invalid response: NULL");
@@ -4123,6 +4526,11 @@ int radio::iccIOForAppResponse(int slotId,
 #if VDBG
     RLOGD("iccIOForAppResponse: serial %d", serial);
 #endif
+
+    /*
+     * The SIM_IO strings are owned by us until the response arrives.
+     */
+    releaseSimIoStrings(serial);
 
     if (radioService[slotId]->mRadioResponse != NULL) {
         RadioResponseInfo responseInfo = {};
@@ -7143,15 +7551,22 @@ int radio::currentSignalStrengthInd(int slotId,
                                     int indicationType, int token, RIL_Errno e,
                                     void *response, size_t responseLen) {
     if (radioService[slotId] != NULL && radioService[slotId]->mRadioIndication != NULL) {
-        if (response == NULL || (responseLen != sizeof(RIL_SignalStrength_v10)
-                && responseLen != sizeof(RIL_SignalStrength_v8))) {
-            RLOGE("currentSignalStrengthInd: invalid response");
+        SignalStrength signalStrength = {};
+        if (response == NULL) {
+            RLOGE("currentSignalStrengthInd: invalid response (NULL)");
+            return 0;
+        } else if (responseLen == sizeof(CAF_RIL_SIGNAL_STRENGTH)) {
+            convertCafRilSignalStrengthToHal(response, signalStrength);
+        } else if (responseLen == sizeof(RIL_SignalStrength_v10)) {
+            convertRilSignalStrengthToHalV10(response, responseLen, signalStrength);
+        } else if (responseLen == sizeof(RIL_SignalStrength_v8)) {
+            convertRilSignalStrengthToHalV8(response, responseLen, signalStrength);
+        } else {
+            RLOGE("currentSignalStrengthInd: invalid response len=%d v8=%d v10=%d",
+                    (int)responseLen, (int)sizeof(RIL_SignalStrength_v8),
+                    (int)sizeof(RIL_SignalStrength_v10));
             return 0;
         }
-
-        SignalStrength signalStrength = {};
-        convertRilSignalStrengthToHal(response, responseLen, signalStrength);
-
 #if VDBG
         RLOGD("currentSignalStrengthInd");
 #endif
